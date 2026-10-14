@@ -493,11 +493,19 @@ async function rewriteAtNewLevel($: Engine): Promise<void> {
 }
 
 /** Saves a detail level in the store and publishes it for drawing. Returns false for a bad value. */
+/** Turns automatic mode on or off, saved and published for other mods. */
+async function setAutoMode($: Engine, isOn: boolean): Promise<void> {
+  await $.store.set(STORE_AUTO, isOn)
+  await update($, autoAtom, () => isOn)
+}
+
+/** Saves the detail level. Auto means "do everything for me", so it also turns automatic mode on. */
 async function setDetail($: Engine, value: string): Promise<boolean> {
   const level = parseDetail(value)
   if (level === undefined) return false
   await $.store.set(STORE_DETAIL, level)
   await update($, detailAtom, () => level)
+  if (level === 'auto') await setAutoMode($, true)
   return true
 }
 
@@ -1297,15 +1305,16 @@ export function registerPromptUpgrade(on: On): void {
       const action = parseBetterArgs(e.args)
       switch (action.kind) {
         case 'on':
-          await $.store.set(STORE_AUTO, true)
-          await update($, autoAtom, () => true)
+          await setAutoMode($, true)
           return { text: 'Automatic mode is on. Prompts you type go to Prompt Upgrade first.' }
         case 'off':
-          await $.store.set(STORE_AUTO, false)
-          await update($, autoAtom, () => false)
+          await setAutoMode($, false)
           return { text: 'Automatic mode is off. Prompts are sent as you type them.' }
         case 'level':
           if (action.level === undefined || !(await setDetail($, action.level))) return { text: BAD_LEVEL_TEXT }
+          if (action.level === 'auto') {
+            return { text: 'Detail is now Auto, and automatic mode is on: prompts you type are checked first.' }
+          }
           return { text: `Detail is now ${DETAIL_SPECS[action.level].label}. New upgrades use it.` }
         case 'history':
           void showHistory($).then(isPlaced => {

@@ -843,7 +843,7 @@ test('automatic mode is published for other mods: the saved switch at start, the
 // ---------------------------------------------------------------------------
 
 /** Every value Prompt Upgrade publishes for one state key. */
-function watchState(on: On, key: 'detailLevel' | 'lastReply' | 'lastIntercepted') {
+function watchState(on: On, key: 'detailLevel' | 'lastReply' | 'lastIntercepted' | 'isAutoOn') {
   const published: unknown[] = []
   on('state.set', { plugin: 'prompt-upgrade' }, async ($, e, next) => {
     if (e.key === key) published.push(e.value)
@@ -1373,7 +1373,7 @@ test('52. Auto is first in the dropdown, /better level auto sets it, and the def
   await typing.unmount()
 
   const ran = await better($, 'level auto', clock)
-  expect(ran.text).toBe('Detail is now Auto. New upgrades use it.')
+  expect(ran.text).toBe('Detail is now Auto, and automatic mode is on: prompts you type are checked first.')
   expect(store[STORE_DETAIL]).toBe('auto')
   expect(published).toEqual(['medium', 'auto'])
   expect((await better($, 'level extreme', clock)).text).toBe('Detail is auto, low, medium or high, e.g. /better level auto.')
@@ -1739,4 +1739,30 @@ test('65. the Auto screens fit at 36, 60 and 140 columns: countdown, chips, hint
   await sendTyped($, 'write a different thing about wasps for my blog')
   await clock.settle()
   for (const columns of [36, 60, 140]) await expectFits($, columns)
+})
+
+test('picking Auto also turns automatic mode on, so typed prompts are checked; Low, Medium and High leave it alone', async ($, on) => {
+  const publishedAuto = watchState(on, 'isAutoOn')
+  const { data: store } = recordingStore(on, { [STORE_AUTO]: false })
+  const { world, clock } = standInForEngine(on, null)
+  await startSession($)
+
+  // Automatic mode off: a typed prompt goes straight through.
+  await sendTyped($, ROUGH)
+  expect(world.submitted).toHaveLength(1)
+
+  await better($, 'level auto', clock)
+  expect(store[STORE_AUTO]).toBe(true)
+  expect(publishedAuto.at(-1)).toBe(true)
+  expect((await sendTyped($, ROUGH)).drop).toBe(DROP_TEXT)
+
+  // The dropdown's Auto does the same; other levels keep whatever automatic mode is.
+  await better($, 'off', clock)
+  await better($, 'level high', clock)
+  expect(store[STORE_AUTO]).toBe(false)
+  await better($, '', clock)
+  const typing = await mountPane($)
+  await typing.select({ key: 'detail-level', value: 'auto' })
+  expect(store[STORE_AUTO]).toBe(true)
+  await typing.unmount()
 })
