@@ -1,0 +1,9 @@
+{
+  "name": "clean-view",
+  "version": "0.1.0",
+  "description": "Hides tool calls, diffs and command output and shows a calm checklist of Claude's plan above the prompt.",
+  "author": {
+    "name": "ataege"
+  },
+  "types": "./types/index.d.ts"
+}
