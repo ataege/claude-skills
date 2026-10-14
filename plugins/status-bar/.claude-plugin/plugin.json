@@ -1,0 +1,9 @@
+{
+  "name": "status-bar",
+  "version": "0.1.0",
+  "description": "One colored line under the prompt: plan, model, effort, context, 7-day and 5-hour limits, and running agents by model and effort.",
+  "author": {
+    "name": "ataege"
+  },
+  "types": "./types/index.d.ts"
+}
