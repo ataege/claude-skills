@@ -1,0 +1,9 @@
+{
+  "name": "mods-menu",
+  "version": "0.1.0",
+  "description": "A Mods button beside the Clean View toggle that opens a small menu with a button for each of your mods.",
+  "author": {
+    "name": "ataege"
+  },
+  "types": "./types/index.d.ts"
+}
