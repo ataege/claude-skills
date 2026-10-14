@@ -31,5 +31,9 @@ declare module 'claude-code' {
       /** Each agent's route, like "haiku/low", by agent id, from its own requests. */
       routes: Record<string, string>
     }
+    // Read only: Prompt Upgrade's automatic mode, shown while it is on.
+    'prompt-upgrade': {
+      isAutoOn: boolean
+    }
   }
 }

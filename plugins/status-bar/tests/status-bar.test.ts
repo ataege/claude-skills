@@ -229,3 +229,23 @@ test('routes read plainly and group most first', () => {
     { label: 'sonnet/medium', count: 1 },
   ])
 })
+
+test("Prompt Upgrade's automatic mode shows as ◇ Better Prompt On at the end, only while it is on", async ($, on) => {
+  // Prompt Upgrade's published value, which the test flips; read through the engine as the bar reads it.
+  let isAutoOn = false
+  on('state.get', { plugin: 'prompt-upgrade' }, () => ({ value: { value: isAutoOn, version: isAutoOn ? 2 : 1 } }))
+  standInForEngine(on)
+  await startSession($)
+
+  const off = await drawBar($, 'terminal')
+  expect(off.line).toBe('◆ Max 20x │ ✻ Opus 5.5 │ ◕ effort high │ ▣ ctx ▰▰▰▱▱▱▱▱▱▱ 30% │ ◷ 7d 64% │ 5h 88% │ ◎ 2 agents')
+
+  isAutoOn = true
+  for (const surface of SURFACES) {
+    const withAuto = await drawBar($, surface)
+    expect(withAuto.line).toBe(
+      '◆ Max 20x │ ✻ Opus 5.5 │ ◕ effort high │ ▣ ctx ▰▰▰▱▱▱▱▱▱▱ 30% │ ◷ 7d 64% │ 5h 88% │ ◎ 2 agents │ ◇ Better Prompt On',
+    )
+    expect(withAuto.pieceColor('◇ Better Prompt On')).toBe('#F2C46D')
+  }
+})

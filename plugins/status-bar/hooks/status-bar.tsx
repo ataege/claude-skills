@@ -29,7 +29,11 @@ export const ICONS = {
   context: '▣',
   limits: '◷',
   agents: '◎',
+  betterPrompt: '◇',
 } as const
+
+// Prompt Upgrade's gold, for its segment.
+const BETTER_PROMPT_COLOR = '#F2C46D'
 
 // The effort symbol fills up with the level: ◔ low, ◑ medium, ◕ high, ● xhigh, ◉ max.
 const EFFORT_ICONS: Readonly<Record<string, string>> = {
@@ -60,6 +64,8 @@ const EMPTY_SNAPSHOT: StatusBarSnapshot = {
 
 const snapshotAtom = atom({ plugin: 'status-bar', key: 'snapshot' } as const, EMPTY_SNAPSHOT)
 const routesAtom = atom({ plugin: 'status-bar', key: 'routes' } as const, {})
+// Prompt Upgrade's automatic mode, read while drawing so a switch redraws the line; false without that mod.
+const betterPromptAtom = atom({ plugin: 'prompt-upgrade', key: 'isAutoOn' } as const, false)
 // The route table keeps the most recent agents only.
 const MAX_TRACKED_ROUTES = 300
 
@@ -294,8 +300,8 @@ function drawLimit(Text: TextElement, label: string, remaining: number | null): 
   ]
 }
 
-/** The status line as one Text: ◆ plan │ ✻ model │ ◕ effort │ ▣ ctx │ ◷ 7d 5h │ ◎ agents. */
-function drawStatusLine(Text: TextElement, snapshot: StatusBarSnapshot): RenderElement {
+/** The status line as one Text: ◆ plan │ ✻ model │ ◕ effort │ ▣ ctx │ ◷ 7d 5h │ ◎ agents, then ◇ Better Prompt On while it is. */
+function drawStatusLine(Text: TextElement, snapshot: StatusBarSnapshot, isBetterPromptOn = false): RenderElement {
   const separator = <Text dimColor>{SEPARATOR}</Text>
   const planName = snapshot.planName ?? 'Subscription'
   const contextPercent = snapshot.contextPercent ?? 0
@@ -348,6 +354,10 @@ function drawStatusLine(Text: TextElement, snapshot: StatusBarSnapshot): RenderE
           {`${snapshot.activeAgents} ${agentWord}`}
         </Text>
       )}
+      {isBetterPromptOn ? [
+        separator,
+        <Text color={BETTER_PROMPT_COLOR}>{`${ICONS.betterPrompt} Better Prompt On`}</Text>,
+      ] : null}
     </Text>
   )
 }
@@ -421,12 +431,13 @@ export function registerStatusBar(on: On): void {
   // The line sits right under the prompt, above the engine's own hint line.
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const snapshot = await read($, snapshotAtom)
+    const isBetterPromptOn = (await read($, betterPromptAtom)) === true
     const engineHint = await next(e)
     const { Box, Text } = $.ui.resolve(e)
 
     return (
       <Box flexDirection="column">
-        {drawStatusLine(Text, snapshot)}
+        {drawStatusLine(Text, snapshot, isBetterPromptOn)}
         {engineHint}
       </Box>
     )
