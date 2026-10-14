@@ -1,8 +1,18 @@
 // Clean View: hides tool rows and shows a calm checklist of Claude's plan above the prompt.
 import { atom, read, update } from 'claude-code'
-import type { ElementConstructor, EngineInterface, On, RenderElement, RenderInput, TextProps, Timer } from 'claude-code'
+import type {
+  BoxProps,
+  ElementConstructor,
+  EngineInterface,
+  On,
+  RenderElement,
+  RenderInput,
+  RenderNode,
+  TextProps,
+  Timer,
+} from 'claude-code'
 
-import type { CleanViewChecklist, CleanViewTask, CleanViewTaskStatus } from '../types'
+import type { CleanViewChecklist, CleanViewHelper, CleanViewTask, CleanViewTaskStatus } from '../types'
 
 // ---------------------------------------------------------------------------
 // Names, limits and wording
@@ -19,6 +29,8 @@ const MAX_PLAN_STEPS = 8
 const METER_CELLS = 10
 const LABEL_CELLS = 7 // fits "Working" and "Up next"
 const ROW_CHROME_CELLS = 2 + 1 + METER_CELLS + 2 + LABEL_CELLS // marker, gaps, meter, label
+const BOX_CHROME_COLUMNS = 4 // border and padding on both sides
+const MAX_HELPER_ROWS = 5 // per step; the rest fold into one line
 const TICK_MS = 250
 const COLLAPSE_AFTER_MS = 5000
 const FAILS_BEFORE_STUCK = 3
@@ -76,14 +88,28 @@ The person is using Clean View: tool calls are hidden from them and they follow 
 - Then call ${REPORT_TOOL} with the current step's name and a percent as real progress happens, and with 100 the moment a step finishes.
 - If this session has TodoWrite or TaskCreate, you may use your to-do list as the plan instead.
 - Write every step name in plain English a non-technical person understands. Keep it under 40 characters and start it with a verb, like "Build the pricing section".
-- Never put file paths, file names, commands, code or tool names in a step name.`
+- Never put file paths, file names, commands, code or tool names in a step name.
+- When you start agents, add to each agent's prompt: 'As you work, call ${REPORT_TOOL} with your task name and a percent at about 25, 50, 75 and 100. Do not call ${PLAN_TOOL}.'`
 
 // Text a tool result carries when the person turned down a permission prompt.
+// Where a new request comes from; helpers' reports, peers' messages and plugins' prompts carry on the current job.
+const NEW_JOB_ORIGINS: ReadonlySet<string> = new Set([
+  'composer',
+  'bridge',
+  'sdk',
+  'unclassified',
+  'scheduled-trigger',
+  'channel',
+  'slack-ping',
+])
+
 const USER_SAID_NO = /user doesn't want to (proceed|take this action)|tool use was rejected|the user (rejected|denied|declined)/i
 
 // File names with a code or config extension, which never belong in a step name.
 const CODE_FILE_NAME =
   /^[\w.@-]*\w\.(tsx?|jsx?|mjs|cjs|mts|cts|py|rb|go|rs|java|kt|swift|c|cc|cpp|h|hpp|cs|php|css|scss|sass|less|html?|json|jsonc|ya?ml|toml|md|mdx|sh|bash|zsh|ps1|sql|vue|svelte|astro|xml|lock|env|ini|cfg|conf|txt|csv|ipynb|dart|lua|scala|exs?|hs|gradle|tf|graphql|proto|prisma)$/i
+
+const BORDER_COLOR = '#3A3A46' // the muted frame around the band
 
 // ---------------------------------------------------------------------------
 // Shared state (declared in types/index.d.ts)
@@ -99,6 +125,7 @@ let areToolsRegistered = false
 let failedCallsInRow = 0
 let lastApiErrorText = ''
 let lastSubmitKind: 'prompt' | 'command' | undefined
+let isMainTurnRunning = false
 
 // ---------------------------------------------------------------------------
 // The one name cleaner
@@ -183,6 +210,7 @@ export function startJob(previousJobId: number, now: number): CleanViewChecklist
     startedAt: now,
     finishedAt: null,
     isCollapsed: false,
+    helpers: [],
   }
 }
 
@@ -354,6 +382,137 @@ export function applyTaskUpdate(
   return { ...checklist, tasks: settleActiveStep(tasks) }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers (the main chat's subagents): pure changes over the shared value
+// ---------------------------------------------------------------------------
+
+/** The checklist's helpers; state saved before helpers existed has none. */
+function helpersOf(checklist: CleanViewChecklist): readonly CleanViewHelper[] {
+  return checklist.helpers ?? []
+}
+
+function changeHelpers(
+  checklist: CleanViewChecklist,
+  isTarget: (helper: CleanViewHelper) => boolean,
+  change: (helper: CleanViewHelper) => CleanViewHelper,
+): CleanViewChecklist {
+  const helpers = helpersOf(checklist)
+  if (!helpers.some(isTarget)) return checklist
+
+  return { ...checklist, helpers: helpers.map(helper => (isTarget(helper) ? change(helper) : helper)) }
+}
+
+/** An Agent call started: a working row under the step that is active now. */
+export function addHelper(checklist: CleanViewChecklist, toolUseId: string, description: unknown, now: number): CleanViewChecklist {
+  const helpers = helpersOf(checklist)
+  if (helpers.some(helper => helper.id === toolUseId)) return checklist
+
+  const helper: CleanViewHelper = {
+    id: toolUseId,
+    agentId: null,
+    name: cleanStepName(description),
+    stepId: checklist.tasks.find(task => task.status === 'active')?.id ?? null,
+    status: 'working',
+    percent: 0,
+    hasReported: false,
+    startedAt: now,
+    finishedAt: null,
+  }
+
+  return { ...checklist, helpers: [...helpers, helper] }
+}
+
+/** An Agent call that was refused never became a helper. */
+export function removeHelper(checklist: CleanViewChecklist, toolUseId: string): CleanViewChecklist {
+  const helpers = helpersOf(checklist)
+  return helpers.some(helper => helper.id === toolUseId)
+    ? { ...checklist, helpers: helpers.filter(helper => helper.id !== toolUseId) }
+    : checklist
+}
+
+export function markHelperStuck(checklist: CleanViewChecklist, toolUseId: string, now: number): CleanViewChecklist {
+  return changeHelpers(checklist, helper => helper.id === toolUseId, helper => ({ ...helper, status: 'stuck', finishedAt: now }))
+}
+
+/** Links the Agent call to the agent that runs it; a link already made stays. */
+export function linkHelperAgent(checklist: CleanViewChecklist, toolUseId: string, agentId: string): CleanViewChecklist {
+  return changeHelpers(
+    checklist,
+    helper => helper.id === toolUseId && helper.agentId === null,
+    helper => ({ ...helper, agentId }),
+  )
+}
+
+/** A helper's own report_progress, found by its agent id. */
+export function reportHelperProgress(checklist: CleanViewChecklist, agentId: string, percent: number): CleanViewChecklist {
+  return changeHelpers(checklist, helper => helper.agentId === agentId, helper => ({ ...helper, percent, hasReported: true }))
+}
+
+/** A helper's turn began (or a message woke it again): it is working. */
+export function startHelperTurn(checklist: CleanViewChecklist, agentId: string): CleanViewChecklist {
+  return changeHelpers(
+    checklist,
+    helper => helper.agentId === agentId,
+    helper => ({ ...helper, status: 'working', finishedAt: null }),
+  )
+}
+
+/** A helper's turn ended: done at 100%, or stuck. */
+export function endHelperTurn(checklist: CleanViewChecklist, agentId: string, isStuck: boolean, now: number): CleanViewChecklist {
+  return changeHelpers(
+    checklist,
+    helper => helper.agentId === agentId,
+    helper =>
+      isStuck
+        ? { ...helper, status: 'stuck', finishedAt: now }
+        : { ...helper, status: 'done', percent: 100, finishedAt: now },
+  )
+}
+
+export function workingHelperCount(checklist: CleanViewChecklist): number {
+  return helpersOf(checklist).filter(helper => helper.status === 'working').length
+}
+
+/** After a reload: settle rows from what the engine says about each agent. */
+export function settleHelpers(
+  checklist: CleanViewChecklist,
+  agents: readonly { id: string; status: string }[],
+  now: number,
+): CleanViewChecklist {
+  const statusByAgent = new Map(agents.map(agent => [agent.id, agent.status]))
+
+  return changeHelpers(
+    checklist,
+    helper => helper.agentId !== null && helper.status === 'working' && statusByAgent.has(helper.agentId),
+    helper => {
+      const agentStatus = statusByAgent.get(helper.agentId ?? '')
+      if (agentStatus === 'completed') return { ...helper, status: 'done', percent: 100, finishedAt: now }
+      if (agentStatus === 'failed' || agentStatus === 'killed') return { ...helper, status: 'stuck', finishedAt: now }
+      return agentStatus === 'idle' ? { ...helper, status: 'idle' } : helper
+    },
+  )
+}
+
+/** The helpers' combined progress, 0 to 100, or null until one has reported or finished. */
+export function helperProgress(helpers: readonly CleanViewHelper[]): number | null {
+  const hasNews = helpers.some(helper => helper.hasReported || helper.status === 'done')
+  if (!hasNews || helpers.length === 0) return null
+  const percentSum = helpers.reduce((sum, helper) => {
+    if (helper.status === 'done') return sum + 100
+    return helper.hasReported ? sum + helper.percent : sum
+  }, 0)
+
+  return Math.round(percentSum / helpers.length)
+}
+
+/** The percent a step's meter shows: its own report, else its helpers' combined progress. */
+export function stepPercent(task: CleanViewTask, helpers: readonly CleanViewHelper[]): { percent: number; hasProgress: boolean } {
+  if (task.hasReported || task.status === 'done') return { percent: task.percent, hasProgress: true }
+  const combined = helperProgress(helpers.filter(helper => helper.stepId === task.id))
+
+  return combined === null ? { percent: task.percent, hasProgress: false } : { percent: combined, hasProgress: true }
+}
+
 export type TurnOutcome =
   | { kind: 'error'; reason: string }
   | { kind: 'refusal' }
@@ -435,6 +594,27 @@ export function formatDuration(milliseconds: number): string {
   return `${seconds}s`
 }
 
+/** True when a tree shows any non-blank text or any Button. Never changes the tree. */
+export function hasVisibleContent(tree: RenderNode | null | undefined): boolean {
+  if (tree === null || tree === undefined) return false
+  if (typeof tree === 'string') return tree.trim() !== ''
+  if (tree.type === 'Button') return true
+
+  return childrenOf(tree).some(hasVisibleContent)
+}
+
+/** A tree's children; elements without any (the engine's own marker) give none. */
+function childrenOf(tree: RenderElement): readonly RenderNode[] {
+  return 'children' in tree ? (tree.children ?? []) : []
+}
+
+/** The direct child of a tree whose key matches, if any. */
+function childWithKey(tree: RenderElement, key: string): RenderNode | undefined {
+  return childrenOf(tree).find(
+    child => typeof child !== 'string' && 'props' in child && (child.props as { key?: unknown } | undefined)?.key === key,
+  )
+}
+
 /** A 10-cell meter filled to `percent`. */
 function filledMeter(percent: number): string {
   const filledCells = Math.round((clampPercent(percent) / 100) * METER_CELLS)
@@ -478,12 +658,11 @@ async function changeChecklist(
   return changed
 }
 
-/** Runs the 250ms frame clock only while a job is working or waiting on the person. */
+/** Runs the 250ms frame clock only while a step is working; a paused sweep just stops. */
 async function syncAnimationTimer($: Engine): Promise<void> {
   const isEnabled = await read($, enabledAtom)
   const checklist = await read($, checklistAtom)
-  const shouldAnimate =
-    isEnabled && checklist !== null && (checklist.phase === 'working' || checklist.phase === 'needsYou')
+  const shouldAnimate = isEnabled && checklist !== null && checklist.phase === 'working'
 
   if (shouldAnimate && animationTimer === undefined) {
     animationTimer = $.clock.every(TICK_MS, () => {
@@ -504,6 +683,20 @@ function scheduleCollapse($: Engine, jobId: number, delayMs: number): void {
         : checklist,
     )
   })
+}
+
+/** When the last helper ends after the main turn did, the job finishes as an answered turn does. */
+async function finishJobIfHelpersDone($: Engine): Promise<void> {
+  if (isMainTurnRunning) return
+  const now = await $.clock.now()
+  let wasWaiting = false
+  const finished = await changeChecklist($, checklist => {
+    wasWaiting = checklist.phase === 'working' && workingHelperCount(checklist) === 0
+    return wasWaiting ? finishTurn(checklist, { kind: 'answer' }, now) : checklist
+  })
+  if (wasWaiting && finished !== null && finished.phase === 'done' && !finished.isCollapsed) {
+    scheduleCollapse($, finished.jobId, COLLAPSE_AFTER_MS)
+  }
 }
 
 /** Asks Haiku for a short job name in the background; a newer job wins. */
@@ -569,47 +762,260 @@ function readStepList(rawSteps: unknown): string[] {
 
 type BandInput = RenderInput<'AbovePrompt'>
 
-async function drawBand($: Engine, e: BandInput): Promise<RenderElement> {
+type TextElement = ElementConstructor<TextProps>
+type BoxElement = ElementConstructor<BoxProps>
+
+/** What a row needs to line its columns up. */
+type RowLayout = { nameWidth: number; rowWidth: number; frame: number }
+
+/** A piece of the header line; the cuttable one gives way when the line is too long. */
+type HeaderSegment = {
+  text: string
+  weight?: 'bold'
+  color?: string
+  backgroundColor?: string
+  isDim?: boolean
+  isCuttable?: boolean
+}
+
+/** The header line for each state of the job, as pieces. */
+function headerSegments(checklist: CleanViewChecklist, now: number, waitingHelpers: number): HeaderSegment[] {
+  switch (checklist.phase) {
+    case 'needsYou':
+      return [
+        { text: ' Needs you ', backgroundColor: 'warning', color: 'inverseText', weight: 'bold' },
+        { text: ' ' },
+        { text: checklist.needsYouReason ?? REASONS.waitingForReply, isCuttable: true },
+      ]
+    case 'stuck':
+      return [
+        { text: '⚠ Stuck:', color: 'warning', weight: 'bold' },
+        { text: ' ' },
+        { text: checklist.stuckReason ?? REASONS.unknownError, isCuttable: true },
+      ]
+    case 'stopped':
+      return [
+        { text: '■ Stopped', weight: 'bold' },
+        { text: ` · ${checklist.title} · you pressed Esc`, isDim: true, isCuttable: true },
+      ]
+    case 'done':
+      return [
+        { text: '✓ All done', color: 'success', weight: 'bold' },
+        {
+          text: ` · ${checklist.title} · took ${formatDuration((checklist.finishedAt ?? now) - checklist.startedAt)}`,
+          isDim: true,
+          isCuttable: true,
+        },
+      ]
+    default:
+      return [
+        { text: checklist.title, weight: 'bold', isCuttable: true },
+        ...(waitingHelpers > 0
+          ? [{ text: ` · Waiting for ${waitingHelpers} ${waitingHelpers === 1 ? 'helper' : 'helpers'}`, isDim: true }]
+          : []),
+        { text: ` · ${formatDuration(now - checklist.startedAt)}`, isDim: true },
+      ]
+  }
+}
+
+/** Cuts the cuttable piece with … so the whole line fits in `maxCells`. */
+function fitSegments(segments: readonly HeaderSegment[], maxCells: number): HeaderSegment[] {
+  const totalCells = segments.reduce((sum, segment) => sum + segment.text.length, 0)
+  const excessCells = totalCells - maxCells
+  if (excessCells <= 0) return [...segments]
+
+  return segments.map(segment =>
+    segment.isCuttable === true
+      ? { ...segment, text: segment.text.slice(0, Math.max(1, segment.text.length - excessCells - 1)).trimEnd() + '…' }
+      : segment,
+  )
+}
+
+function drawSegments(Text: TextElement, segments: readonly HeaderSegment[]): RenderElement {
+  return (
+    <Text>
+      {segments.map(segment => {
+        const style: TextProps = {}
+        if (segment.color !== undefined) style.color = segment.color
+        if (segment.backgroundColor !== undefined) style.backgroundColor = segment.backgroundColor
+        if (segment.weight !== undefined) style.weight = segment.weight
+        if (segment.isDim === true) style.dimColor = true
+        return <Text {...style}>{segment.text}</Text>
+      })}
+    </Text>
+  )
+}
+
+/** How many cells a tree takes in a row: its text, and a Button's label with its brackets. */
+function contentWidth(tree: RenderNode | undefined): number {
+  if (tree === undefined) return 0
+  if (typeof tree === 'string') return tree.length
+  if (tree.type === 'Button') return String((tree.props as { label?: unknown }).label ?? '').length + 4
+
+  return childrenOf(tree).reduce((sum, child) => sum + contentWidth(child), 0)
+}
+
+/** How many helpers the job waits on once the main turn has ended. */
+function waitingHelperCount(checklist: CleanViewChecklist): number {
+  return checklist.phase === 'working' && !isMainTurnRunning ? workingHelperCount(checklist) : 0
+}
+
+/** Up to five helper rows for one step, then one dim line for the rest. */
+function drawHelperRows(
+  Box: BoxElement,
+  Text: TextElement,
+  stepHelpers: readonly CleanViewHelper[],
+  { nameWidth, rowWidth, frame }: RowLayout,
+): RenderElement[] {
+  // Helpers still needing a look come first, finished ones after.
+  const isFinished = (helper: CleanViewHelper) => helper.status === 'done'
+  const ordered = [...stepHelpers.filter(helper => !isFinished(helper)), ...stepHelpers.filter(isFinished)]
+  const shown = ordered.slice(0, MAX_HELPER_ROWS)
+  const hidden = ordered.slice(MAX_HELPER_ROWS)
+
+  const rows: RenderElement[] = shown.map((helper, index) => {
+    const isLastRow = index === shown.length - 1 && hidden.length === 0
+    const name = fitToWidth(helper.name, nameWidth - 2)
+    const glyph = <Text dimColor>{`  ${isLastRow ? '└' : '├'} `}</Text>
+    let nameText: RenderElement = <Text>{name}</Text>
+    let meter: RenderElement = <Text color="claude">{helper.hasReported ? filledMeter(helper.percent) : sweepMeter(frame)}</Text>
+    let label: RenderElement = <Text>{helper.hasReported ? `${helper.percent}%` : 'Working'}</Text>
+    if (helper.status === 'done') {
+      nameText = <Text dimColor>{name}</Text>
+      meter = <Text color="success">{filledMeter(100)}</Text>
+      label = <Text dimColor>Done</Text>
+    } else if (helper.status === 'stuck') {
+      meter = <Text color="warning">{filledMeter(helper.percent)}</Text>
+      label = <Text color="warning">Stuck</Text>
+    } else if (helper.status === 'idle') {
+      meter = <Text dimColor>{filledMeter(helper.percent)}</Text>
+      label = <Text dimColor>Idle</Text>
+    }
+
+    return (
+      <Box key={`helper-${helper.id}`} width={rowWidth}>
+        <Text wrap="truncate-end">
+          {glyph}
+          {nameText} {meter}
+          {'  '}
+          {label}
+        </Text>
+      </Box>
+    )
+  })
+
+  if (hidden.length > 0) {
+    const hiddenDoneCount = hidden.filter(isFinished).length
+    rows.push(
+      <Box key="helper-more" width={rowWidth}>
+        <Text dimColor wrap="truncate-end">
+          {'  '}└ +{hidden.length} more helpers · {hiddenDoneCount} done
+        </Text>
+      </Box>,
+    )
+  }
+
+  return rows
+}
+
+async function drawBand($: Engine, e: BandInput, beneath: RenderElement | undefined): Promise<RenderElement> {
   const { Box, Text, Button } = $.ui.resolve(e)
   const isEnabled = await read($, enabledAtom)
   const checklist = await read($, checklistAtom)
   const frame = await read($, tickAtom)
   const bodyColumns = Math.max(24, e.props.bodyColumns)
 
+  const toggleLabel = isEnabled ? '● Clean View: ON' : '○ Clean View: OFF'
   const toggleButton = (
     <Button
       key="toggle"
-      label={isEnabled ? '● Clean View: ON' : '○ Clean View: OFF'}
+      label={toggleLabel}
       onPress={() => {
         void setCleanView($, 'flip')
       }}
     />
   )
 
+  // What a hook beneath offers: its corner and body slots, or a whole tree to show under the rows.
+  const slots = beneath !== undefined && beneath.type === 'Box' && beneath.props?.key === 'band-slots' ? beneath : undefined
+  const cornerContent = slots === undefined ? undefined : childWithKey(slots, 'corner')
+  const bodyContent = slots === undefined ? undefined : childWithKey(slots, 'body')
+  const extraTree = slots === undefined && hasVisibleContent(beneath) ? beneath : undefined
+  const beneathRows = extraTree === undefined ? [] : [<Box key="band-beneath">{extraTree}</Box>]
+
+  // The header never outgrows the band: it leaves room for the toggle, the corner and the box.
+  const toggleCells = toggleLabel.length + 4
+  const cornerCells = cornerContent === undefined ? 0 : contentWidth(cornerContent) + 1
+  const headerCells = Math.max(10, bodyColumns - BOX_CHROME_COLUMNS - toggleCells - cornerCells - 2)
+
   const showsJob = isEnabled && checklist !== null && checklist.phase !== 'idle'
-  const header = showsJob ? drawHeader(Text, checklist, await $.clock.now()) : <Text> </Text>
+  const header = showsJob
+    ? drawSegments(Text, fitSegments(headerSegments(checklist, await $.clock.now(), waitingHelperCount(checklist)), headerCells))
+    : <Text dimColor>Ready</Text>
+
+  // The box hugs its widest row; the spacer pushes the toggle and corner to its right edge.
   const headerRow = (
-    <Box flexDirection="row" width={bodyColumns}>
-      <Box flexGrow={1} flexShrink={1} minWidth={0}>
-        {header}
-      </Box>
-      <Box flexShrink={0} marginLeft={1}>
+    <Box key="band-header" flexDirection="row">
+      <Box flexShrink={0}>{header}</Box>
+      <Box flexGrow={1} />
+      <Box flexShrink={0} flexDirection="row" marginLeft={2}>
         {toggleButton}
+        <Box key="band-corner" flexDirection="row" flexShrink={0} marginLeft={cornerContent === undefined ? 0 : 1}>
+          {cornerContent}
+        </Box>
       </Box>
     </Box>
   )
-  if (!showsJob || checklist.isCollapsed) return <Box flexDirection="column">{headerRow}</Box>
+  const bodySlot = (
+    <Box key="band-body" flexDirection="column" alignItems="flex-end">
+      {bodyContent}
+    </Box>
+  )
+  const drawFrame = (children: RenderNode[]) => (
+    <Box flexDirection="column" alignItems="flex-start">
+      <Box key="band-frame" flexDirection="column" borderStyle="round" borderColor={BORDER_COLOR} paddingX={1}>
+        {children}
+      </Box>
+    </Box>
+  )
+  if (!showsJob || checklist.isCollapsed) return drawFrame([headerRow, bodySlot, ...beneathRows])
 
-  // Size the name column to the longest name that fits beside the meter.
-  const longestName = Math.max(...checklist.tasks.map(task => task.name.length), 8)
-  const nameWidth = Math.max(6, Math.min(longestName, MAX_NAME_LENGTH, bodyColumns - ROW_CHROME_CELLS))
+  // "Step 3 of 5" and one parallelogram per step: filled for done steps.
+  const helpers = helpersOf(checklist)
+  const stepCount = checklist.tasks.length
+  const doneCount = checklist.tasks.filter(task => task.status === 'done').length
+  const stepLabel = `Step ${Math.min(stepCount, doneCount + 1)} of ${stepCount}`
+  const progressRow = (
+    <Box key="band-progress" width={stepLabel.length + 2 + stepCount}>
+      <Text>
+        {stepLabel}
+        {'  '}
+        <Text color="claude">{'▰'.repeat(doneCount)}</Text>
+        <Text dimColor>{'▱'.repeat(stepCount - doneCount)}</Text>
+      </Text>
+    </Box>
+  )
+
+  // Size the name column to the longest name (helpers sit two cells further in) that fits beside the meter.
+  const longestName = Math.max(
+    ...checklist.tasks.map(task => task.name.length),
+    ...helpers.map(helper => helper.name.length + 2),
+    8,
+  )
+  const nameWidth = Math.max(6, Math.min(longestName, MAX_NAME_LENGTH, bodyColumns - BOX_CHROME_COLUMNS - ROW_CHROME_CELLS))
+  const rowWidth = 2 + nameWidth + 1 + METER_CELLS + 2 + LABEL_CELLS
+  const rowLayout: RowLayout = { nameWidth, rowWidth, frame }
+  const isWorking = checklist.phase === 'working'
+  const isPaused = checklist.phase === 'needsYou'
   const firstUpcomingId = checklist.tasks.find(task => task.status === 'upcoming')?.id
+  const stepIds = new Set(checklist.tasks.map(task => task.id))
 
-  const rows = checklist.tasks.map(task => {
+  const rows = checklist.tasks.flatMap((task, taskIndex) => {
     const name = fitToWidth(task.name, nameWidth)
+    let stepRow: RenderElement
     if (task.status === 'done') {
-      return (
-        <Box key={`row-${task.id}`}>
+      stepRow = (
+        <Box key={`row-${task.id}`} width={rowWidth}>
           <Text wrap="truncate-end">
             <Text color="success">✓</Text> <Text dimColor>{name}</Text>{' '}
             <Text color="success">{filledMeter(100)}</Text>{'  '}
@@ -617,91 +1023,54 @@ async function drawBand($: Engine, e: BandInput): Promise<RenderElement> {
           </Text>
         </Box>
       )
-    }
-    if (task.status === 'active') {
-      const isPaused = checklist.phase === 'needsYou'
-      const meter = task.hasReported
-        ? filledMeter(task.percent)
-        : sweepMeter(checklist.phase === 'working' ? frame : 0)
-      return (
-        <Box key={`row-${task.id}`}>
+    } else if (task.status === 'active') {
+      // Helpers' combined progress fills the meter until the step reports its own.
+      const stepProgress = stepPercent(task, helpers)
+      const meter = stepProgress.hasProgress ? filledMeter(stepProgress.percent) : sweepMeter(isWorking ? frame : 0)
+      stepRow = (
+        <Box key={`row-${task.id}`} width={rowWidth}>
           <Text wrap="truncate-end">
             <Text color={isPaused ? 'warning' : 'claude'}>{isPaused ? '‖' : '▶'}</Text>{' '}
             <Text weight="bold">{name}</Text> <Text color="claude">{meter}</Text>{'  '}
-            <Text>{task.hasReported ? `${task.percent}%` : 'Working'}</Text>
+            <Text>{stepProgress.hasProgress ? `${stepProgress.percent}%` : 'Working'}</Text>
+          </Text>
+        </Box>
+      )
+    } else {
+      stepRow = (
+        <Box key={`row-${task.id}`} width={rowWidth}>
+          <Text wrap="truncate-end" dimColor>
+            ○ {name} {'░'.repeat(METER_CELLS)}
+            {'  '}
+            {task.id === firstUpcomingId ? 'Next' : 'Up next'}
           </Text>
         </Box>
       )
     }
-    return (
-      <Box key={`row-${task.id}`}>
-        <Text wrap="truncate-end" dimColor>
-          ○ {name} {'░'.repeat(METER_CELLS)}
-          {'  '}
-          {task.id === firstUpcomingId ? 'Next' : 'Up next'}
-        </Text>
-      </Box>
+
+    // Helper rows hang under their step while it is active or a helper still works; none once done.
+    const isLastStep = taskIndex === checklist.tasks.length - 1
+    const stepHelpers = helpers.filter(
+      helper => helper.stepId === task.id || (isLastStep && (helper.stepId === null || !stepIds.has(helper.stepId))),
     )
+    const showsHelpers =
+      checklist.phase !== 'done' &&
+      stepHelpers.length > 0 &&
+      (task.status === 'active' || stepHelpers.some(helper => helper.status === 'working'))
+    if (!showsHelpers) return [stepRow]
+
+    return [stepRow, ...drawHelperRows(Box, Text, stepHelpers, { ...rowLayout, frame: isWorking ? frame : 0 })]
   })
 
-  return (
-    <Box flexDirection="column">
-      {headerRow}
+  return drawFrame([
+    headerRow,
+    bodySlot,
+    progressRow,
+    <Box key="band-rows" flexDirection="column">
       {rows}
-    </Box>
-  )
-}
-
-type TextElement = ElementConstructor<TextProps>
-
-/** The header line for each state of the job. */
-function drawHeader(Text: TextElement, checklist: CleanViewChecklist, now: number): RenderElement {
-  switch (checklist.phase) {
-    case 'needsYou':
-      return (
-        <Text wrap="truncate-end">
-          <Text backgroundColor="warning" color="inverseText" weight="bold">
-            {' Needs you '}
-          </Text>{' '}
-          {checklist.needsYouReason ?? REASONS.waitingForReply}
-        </Text>
-      )
-    case 'stuck':
-      return (
-        <Text wrap="truncate-end">
-          <Text color="warning" weight="bold">
-            ⚠ Stuck:
-          </Text>{' '}
-          {checklist.stuckReason ?? REASONS.unknownError}
-        </Text>
-      )
-    case 'stopped':
-      return (
-        <Text wrap="truncate-end">
-          <Text weight="bold">■ Stopped</Text>
-          <Text dimColor> · {checklist.title} · you pressed Esc</Text>
-        </Text>
-      )
-    case 'done':
-      return (
-        <Text wrap="truncate-end">
-          <Text color="success" weight="bold">
-            ✓ All done
-          </Text>
-          <Text dimColor>
-            {' '}
-            · {checklist.title} · took {formatDuration((checklist.finishedAt ?? now) - checklist.startedAt)}
-          </Text>
-        </Text>
-      )
-    default:
-      return (
-        <Text wrap="truncate-end">
-          <Text weight="bold">{checklist.title}</Text>
-          <Text dimColor> · {formatDuration(now - checklist.startedAt)}</Text>
-        </Text>
-      )
-  }
+    </Box>,
+    ...beneathRows,
+  ])
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +1141,15 @@ export function registerCleanView(on: On): void {
       scheduleCollapse($, checklist.jobId, COLLAPSE_AFTER_MS - elapsedSinceDone)
     }
 
+    // Helpers that ended while the plugin was away settle from the engine's list.
+    try {
+      const agents = await $.agent.list()
+      const now = await $.clock.now()
+      await changeChecklist($, current => settleHelpers(current, agents, now))
+    } catch {
+      // Rows stay as they were.
+    }
+
     return next(e)
   })
 
@@ -788,14 +1166,27 @@ export function registerCleanView(on: On): void {
   })
 
   // Note whether the next turn comes from a typed prompt or a slash command.
-  on('prompt.submit', ($, e, next) => {
-    lastSubmitKind = e.command !== undefined ? 'command' : e.isMeta ? undefined : 'prompt'
-    return next(e)
+  on('prompt.submit', async ($, e, next) => {
+    // A plugin that sends the person's own words (asUser), like Prompt Upgrade's Run, starts a job too.
+    const isSentAsPerson = e.origin.kind === 'plugin' && e.origin.asUser === true
+    const isPersonsRequest = !e.isMeta && (NEW_JOB_ORIGINS.has(e.origin.kind) || isSentAsPerson)
+    lastSubmitKind = e.command !== undefined ? 'command' : isPersonsRequest ? 'prompt' : undefined
+
+    const submitted = await next(e)
+    // A prompt another mod held back never starts a turn, so it must not mark the next one.
+    if (submitted.drop !== undefined) lastSubmitKind = undefined
+    return submitted
   }).catch(($, e, next) => next(e))
 
   // A real prompt while nothing is running starts a new job; a reply resumes a waiting one.
   on('turn.start', async ($, e, next) => {
-    if (e.agentId !== undefined) return next(e)
+    // A helper's turn: its row is working again.
+    const helperAgentId = e.agentId
+    if (helperAgentId !== undefined) {
+      await changeChecklist($, checklist => startHelperTurn(checklist, helperAgentId))
+      return next(e)
+    }
+    isMainTurnRunning = true
 
     const submitKind = lastSubmitKind
     lastSubmitKind = undefined
@@ -803,7 +1194,8 @@ export function registerCleanView(on: On): void {
     lastApiErrorText = ''
 
     const promptText = e.text.trim()
-    const isRealPrompt = promptText !== '' && !promptText.startsWith('/') && submitKind !== 'command'
+    // Only a typed prompt starts a job; a meta or engine-made turn (a helper's report) carries on the current one.
+    const isRealPrompt = promptText !== '' && !promptText.startsWith('/') && submitKind === 'prompt'
     const current = await read($, checklistAtom)
     const isWaitingOnPerson =
       current !== null &&
@@ -832,8 +1224,15 @@ export function registerCleanView(on: On): void {
     const callInput = e as unknown as Record<string, unknown>
 
     if (toolName === PLAN_TOOL || toolName === REPORT_TOOL) {
-      if (e.agentId !== undefined) {
-        return { result: 'Only the main conversation keeps the checklist. Carry on with your task.' }
+      const reportingAgentId = e.agentId
+      if (reportingAgentId !== undefined) {
+        if (toolName === PLAN_TOOL) {
+          return { result: 'Only the main conversation keeps the checklist. Carry on with your task.' }
+        }
+        // A helper's report lands on its row; one with no row gets the same answer.
+        const helperPercent = clampPercent(callInput.percent)
+        await changeChecklist($, checklist => reportHelperProgress(checklist, reportingAgentId, helperPercent))
+        return { result: `Progress noted: ${helperPercent}%.` }
       }
       const now = await $.clock.now()
       if (toolName === PLAN_TOOL) {
@@ -869,10 +1268,24 @@ export function registerCleanView(on: On): void {
       toolName === 'AskUserQuestion' ? markNeedsYou(checklist, REASONS.question) : clearNeedsYou(checklist),
     )
 
+    // An Agent call from the main chat is a helper: a working row before it runs.
+    const helperCallId = e.tool === 'Agent' ? e.tool_use_id : undefined
+    if (e.tool === 'Agent') {
+      const startedAt = await $.clock.now()
+      await changeChecklist($, checklist => addHelper(checklist, e.tool_use_id, e.description, startedAt))
+    }
+
     const ran = await next(e)
-    if (ran.deny !== undefined) return ran
+    if (ran.deny !== undefined) {
+      if (helperCallId !== undefined) await changeChecklist($, checklist => removeHelper(checklist, helperCallId))
+      return ran
+    }
 
     if (ran.isError === true) {
+      if (helperCallId !== undefined) {
+        const failedAt = await $.clock.now()
+        await changeChecklist($, checklist => markHelperStuck(checklist, helperCallId, failedAt))
+      }
       const errorText = `${ran.text ?? ''} ${typeof ran.result === 'string' ? ran.result : ''}`
       if (USER_SAID_NO.test(errorText)) {
         failedCallsInRow = 0
@@ -890,8 +1303,13 @@ export function registerCleanView(on: On): void {
 
     // A success clears Stuck and Needs you, and to-do tools become checklist rows.
     failedCallsInRow = 0
+    const launched = ran.result as { agentId?: unknown; agent_id?: unknown } | undefined
+    const launchedAgentId = launched?.agentId ?? launched?.agent_id
     await changeChecklist($, checklist => {
       const resumed = clearStuck(clearNeedsYou(checklist))
+      if (helperCallId !== undefined && typeof launchedAgentId === 'string') {
+        return linkHelperAgent(resumed, helperCallId, launchedAgentId)
+      }
       if (e.tool === 'TodoWrite') return applyTodos(resumed, e.todos)
       if (e.tool === 'TaskCreate') {
         const created = ran.result as { task?: { id?: unknown } } | undefined
@@ -939,7 +1357,16 @@ export function registerCleanView(on: On): void {
 
   // The end of a turn: error, refusal, Esc, waiting for a reply, or all done.
   on('turn.complete', async ($, e, next) => {
-    if (e.agentId !== undefined) return next(e)
+    // A helper's turn ended: its row is done or stuck, and the last one may finish the job.
+    const helperAgentId = e.agentId
+    if (helperAgentId !== undefined) {
+      const isStuck = e.reason !== 'answer' || e.isAborted
+      const helperEndedAt = await $.clock.now()
+      await changeChecklist($, checklist => endHelperTurn(checklist, helperAgentId, isStuck, helperEndedAt))
+      await finishJobIfHelpersDone($)
+      return next(e)
+    }
+    isMainTurnRunning = false
 
     const outcome: TurnOutcome =
       e.reason === 'error'
@@ -949,6 +1376,15 @@ export function registerCleanView(on: On): void {
           : e.isAborted || e.reason === 'aborted'
             ? { kind: 'aborted' }
             : { kind: 'answer' }
+    // An answer while helpers still work does not end the job; the last helper's end does.
+    if (outcome.kind === 'answer') {
+      const current = await read($, checklistAtom)
+      if (current !== null && current.phase === 'working' && workingHelperCount(current) > 0) {
+        await syncAnimationTimer($)
+        return next(e)
+      }
+    }
+
     const now = await $.clock.now()
     const finished = await changeChecklist($, checklist => finishTurn(checklist, outcome, now))
     if (finished !== null && finished.phase === 'done' && !finished.isCollapsed) {
@@ -958,10 +1394,21 @@ export function registerCleanView(on: On): void {
     return next(e)
   })
 
-  // The band above the prompt: the checklist and the on/off button.
+  // A helper the main chat spawned: link its agent id to its row.
+  on('agent.spawn', { subagentType: /^/ }, async ($, e, next) => {
+    const spawned = await next(e)
+    const spawnedAgentId = spawned.agentId
+    if (spawned.deny === undefined && spawnedAgentId !== undefined && e.parentAgentId === undefined && e.workflow === undefined) {
+      await changeChecklist($, checklist => linkHelperAgent(checklist, e.tool_use_id, spawnedAgentId))
+    }
+    return spawned
+  }).catch(($, e, next) => next(e))
+
+  // The band above the prompt: the checklist and the on/off button, with room for what a hook beneath adds.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
-    return drawBand($, e)
+    const beneath = await next(e)
+    return drawBand($, e, beneath ?? undefined)
   })
 
   // Hide the technical rows while Clean View is on.

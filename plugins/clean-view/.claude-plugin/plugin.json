@@ -1,7 +1,7 @@
 {
   "name": "clean-view",
-  "version": "0.1.0",
-  "description": "Hides tool calls, diffs and command output and shows a calm checklist of Claude's plan above the prompt.",
+  "version": "0.2.0",
+  "description": "Clean View hides tool calls and shows a calm checklist above the prompt; Agent Dock splits each request across a team of helpers you pick and shows each one live.",
   "author": {
     "name": "ataege"
   },
