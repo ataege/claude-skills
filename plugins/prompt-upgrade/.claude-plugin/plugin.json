@@ -1,0 +1,9 @@
+{
+  "name": "prompt-upgrade",
+  "version": "0.1.0",
+  "description": "Turns a rough prompt into a great one before it is sent: asks up to three quick questions, rewrites it, and shows the original and the upgrade side by side. Nothing runs until you press Run.",
+  "author": {
+    "name": "ataege"
+  },
+  "types": "./types/index.d.ts"
+}
