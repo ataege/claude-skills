@@ -3,12 +3,12 @@
   "owner": {
     "name": "ataege"
   },
-  "description": "Claude Code mods by ataege: a calm checklist view, a colored status bar and model routing for agents.",
+  "description": "Claude Code mods by ataege: a calm checklist view, a colored status bar, model routing for agents, a menu for them all and a prompt upgrader.",
   "plugins": [
     {
       "name": "clean-view",
       "source": "./plugins/clean-view",
-      "description": "Hides tool calls, diffs and command output and shows a calm checklist of Claude's plan above the prompt."
+      "description": "Clean View hides tool calls and shows a calm checklist above the prompt; Agent Dock splits each request across a team of helpers you pick and shows each one live."
     },
     {
       "name": "status-bar",
@@ -19,6 +19,16 @@
       "name": "model-routing",
       "source": "./plugins/model-routing",
       "description": "Routes every delegated agent to the cheapest model tier that can do the job well, at an explicit effort, with spawn limits and a routing guide Claude always sees."
+    },
+    {
+      "name": "mods-menu",
+      "source": "./plugins/mods-menu",
+      "description": "A ☰ Mods button beside the Clean View toggle that opens a small menu of your mods and their controls: Clean View on or off, the Agent Dock and its Team Size, and more."
+    },
+    {
+      "name": "prompt-upgrade",
+      "source": "./plugins/prompt-upgrade",
+      "description": "Turns a rough prompt into a great one before it is sent: up to three quick questions, a rewrite, and the original and the upgrade side by side. Nothing runs until you press Run."
     }
   ]
 }
